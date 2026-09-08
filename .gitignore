@@ -1,0 +1,24 @@
+
+# Local state, uploaded images, model compilation caches and logs
+/data/
+__pycache__/
+*.py[cod]
+*.log
+*.pid
+
+# Downloaded models and runtimes (keep rendering assets in static/vendor)
+*.gguf
+*.safetensors
+*.bin
+*.onnx
+/openvino*.xml
+/models/
+.venv/
+venv/
+node_modules/
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
