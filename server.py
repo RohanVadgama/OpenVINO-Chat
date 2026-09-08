@@ -1,6 +1,7 @@
 """Local OpenVINO chat. Python standard library only; uses installed OVMS."""
 import base64
 import re
+from storage import Storage
 import atexit
 import hashlib
 import http.server
@@ -8,6 +9,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shutil
 import secrets
 import socket
 import subprocess
@@ -21,11 +23,19 @@ DATA = ROOT / 'data'
 DATA.mkdir(exist_ok=True)
 IMAGES = DATA / 'images'
 IMAGES.mkdir(exist_ok=True)
+STORAGE = Storage(DATA)
 INSTALL = Path(os.environ['LOCALAPPDATA']) / 'Programs/AI Playground/resources'
 OVMS = INSTALL / 'OpenVINO/ovms'
 PORT = 48200
 TOKEN = secrets.token_urlsafe(32)
 LOCK = threading.Lock()
+STOPPING = threading.Event()
+TAB_LOCK = threading.Lock()
+TABS = {}
+LAST_TAB_ACTIVITY = time.monotonic()
+SEEN_TAB = False
+TAB_CLOSE_GRACE = 15
+TAB_TIMEOUT = 180
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 STATE = {'phase': 'idle', 'model': None, 'device': None, 'error': None}
 PROCESS = None
@@ -34,7 +44,7 @@ BACKEND_PORT = None
 
 
 def roots():
-    defaults = [str(INSTALL / 'models/LLM/openvino'), str(ROOT.parents[1] / 'work/qwen35-openvino')]
+    defaults = [str(INSTALL / 'models/LLM/openvino')]
     try:
         return defaults + json.loads((DATA / 'folders.json').read_text())
     except (OSError, ValueError):
@@ -55,9 +65,9 @@ def models():
         for candidate in candidates:
             if not valid_model(candidate):
                 continue
-            name = candidate.name.replace('OpenVINO---', '').replace('-int4-gq-ov', ' · INT4').replace('-int4-ov', ' · INT4')
+            name = candidate.name.replace('OpenVINO---', '').replace('-int4-gq-ov', ' Â· INT4').replace('-int4-ov', ' Â· INT4')
             if candidate.name == 'qwen35-openvino':
-                name = 'Qwen3.5 4B · INT4'
+                name = 'Qwen3.5 4B Â· INT4'
             key = hashlib.sha256(str(candidate.resolve()).lower().encode()).hexdigest()[:16]
             result[key] = {'id': key, 'name': name, 'path': str(candidate.resolve()), 'vision': any(candidate.glob('openvino_vision*.xml'))}
     return list(result.values())
@@ -108,6 +118,7 @@ node {
  models_path: MODEL_PATH
  device: DEVICE
  max_num_seqs: 1
+ max_tokens_limit: 65536
  enable_prefix_caching: false
  } }
  input_stream_handler { input_stream_handler: "SyncSetInputStreamHandler" options {
@@ -127,9 +138,12 @@ node {
         '--rest_port', str(BACKEND_PORT), '--rest_bind_address', '127.0.0.1', '--cache_dir', str(cache / 'cache')],
         env=env, cwd=str(OVMS), stdout=LOG, stderr=subprocess.STDOUT,
         creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+    process = PROCESS
     deadline = time.monotonic() + 240
     while time.monotonic() < deadline:
-        if PROCESS.poll() is not None:
+        if STOPPING.is_set():
+            raise RuntimeError('The app is shutting down. Reopen it to load a model.')
+        if process.poll() is not None:
             raise RuntimeError('OpenVINO could not load this model. Details are in data/backend.log.')
         try:
             with OPENER.open(f'http://127.0.0.1:{BACKEND_PORT}/v1/config', timeout=1) as response:
@@ -142,6 +156,23 @@ node {
         time.sleep(.4)
     raise RuntimeError('Model loading timed out after four minutes. See data/backend.log.')
 
+
+
+BACKUP_LOCK = threading.Lock()
+
+def backup_folder():
+    try:
+        return json.loads((DATA / 'backup-config.json').read_text()).get('folder', '')
+    except (OSError, ValueError):
+        return ''
+
+def checked_backup_folder(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError('Choose a backup folder first.')
+    p = Path(value).expanduser()
+    if not p.is_absolute():
+        raise ValueError('Use an absolute folder path.')
+    return p.resolve()
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -162,15 +193,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if not self.safe_host():
             return self.reply({'error': 'Invalid host'}, 403)
+        if self.path == '/api/backup':
+            return self.reply(dict(STORAGE.config(), purged=STORAGE.tombstones()))
         if self.path == '/api/status':
-            if PROCESS and PROCESS.poll() is not None and STATE['phase'] == 'ready':
+            process = PROCESS
+            if process and process.poll() is not None and STATE['phase'] == 'ready':
                 STATE.update(phase='error', error='The model server stopped. Load the model again.')
-            return self.reply(dict(STATE, models=models(), token=TOKEN))
+            return self.reply(dict(STATE, models=models(), token=TOKEN, purged=STORAGE.tombstones()))
         if self.path.startswith('/images/'):
             name = self.path.removeprefix('/images/')
-            if not re.fullmatch(r'[a-f0-9]{32}\.jpg', name) or not (IMAGES / name).is_file():
+            if not re.fullmatch(r'[a-f0-9]{32}\.jpg', name) or not STORAGE.image_path(name).is_file():
                 return self.reply({'error': 'Image not found'}, 404)
-            image = (IMAGES / name).read_bytes()
+            image = STORAGE.image_path(name).read_bytes()
             self.send_response(200)
             self.send_header('Content-Type', 'image/jpeg')
             self.send_header('Content-Length', str(len(image)))
@@ -202,9 +236,44 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply({'error': 'Invalid origin'}, 403)
         try:
             length = int(self.headers.get('Content-Length', 0))
-            if length > (8000000 if self.path == "/api/images" else 200000) or length < 0:
+            if length > (20000000 if self.path in ["/api/images", "/api/backup/save"] else 1200000) or length < 0:
                 raise ValueError('Request too large.')
             body = json.loads(self.rfile.read(length) or b'{}')
+            if self.path in ['/api/tab/ping', '/api/tab/close']:
+                global LAST_TAB_ACTIVITY, SEEN_TAB
+                tab_id = body.get('id', '')
+                if not isinstance(tab_id, str) or len(tab_id) > 100 or not tab_id:
+                    raise ValueError('Invalid tab identifier.')
+                with TAB_LOCK:
+                    LAST_TAB_ACTIVITY = time.monotonic()
+                    SEEN_TAB = True
+                    if self.path.endswith('/close'):
+                        TABS.pop(tab_id, None)
+                    else:
+                        TABS[tab_id] = LAST_TAB_ACTIVITY
+                return self.reply({'ok': True})
+            if self.path == '/api/backup/config':
+                with BACKUP_LOCK:
+                    config = STORAGE.configure(body)
+                    if config['folder']: STORAGE.migrate_images()
+                return self.reply(config)
+            if self.path == '/api/backup/save':
+                if body.get('store_folder') != STORAGE.config()['folder']:
+                    raise ValueError('Storage folder changed. Reload the selected folder before saving.')
+                with BACKUP_LOCK: result = STORAGE.save(body)
+                return self.reply(result)
+            if self.path == '/api/conversation/delete':
+                if body.get('store_folder') != STORAGE.config()['folder']:
+                    raise ValueError('Storage folder changed. Reload before deleting.')
+                name = hashlib.sha256(str(body['id']).encode()).hexdigest()+'.json'
+                with BACKUP_LOCK: (STORAGE.folder()/'chats'/name).unlink(missing_ok=True)
+                return self.reply({'deleted':True})
+            if self.path == '/api/backup/restore':
+                with BACKUP_LOCK: result = STORAGE.restore(body.get('folder',''))
+                return self.reply(result)
+            if self.path == '/api/images/purge':
+                with BACKUP_LOCK: removed = STORAGE.purge(force=bool(body.get('all',False)))
+                return self.reply({'purged':removed})
             if self.path == '/api/images':
                 raw = body.get('data', '')
                 if not raw.startswith('data:image/jpeg;base64,'):
@@ -213,8 +282,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if len(content) > 5000000 or not content.startswith(b'\xff\xd8\xff'):
                     raise ValueError('Invalid image or image exceeds 5 MB.')
                 name = secrets.token_hex(16) + '.jpg'
-                (IMAGES / name).write_bytes(content)
-                return self.reply({'id': name})
+                (STORAGE.image_dir() / name).write_bytes(content)
+                return self.reply({'id': name, 'purged': STORAGE.purge()})
             if self.path == '/api/folders':
                 p = Path(body.get('path', '')).expanduser().resolve()
                 if not valid_model(p):
@@ -229,7 +298,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply({'error': 'A model is loading or generating. Stop or wait for it first.'}, 409)
             try:
                 if self.path == '/api/load':
-                    load(body['model'], body.get('device', 'GPU'))
+                    try:
+                        load(body['model'], body.get('device', 'GPU'))
+                    except Exception as e:
+                        unload()
+                        STATE.update(phase='error', error=str(e))
+                        raise
                     return self.reply(STATE)
                 if self.path == '/api/unload':
                     unload()
@@ -242,9 +316,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass
         except Exception as e:
-            if STATE['phase'] == 'loading':
-                unload()
-                STATE.update(phase='error', error=str(e))
             self.reply({'error': str(e)}, 400)
 
     def chat(self, body):
@@ -273,12 +344,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     parts.append(part)
                 elif part.get('type') == 'image_ref':
                     name = part.get('id', '')
-                    if not re.fullmatch(r'[a-f0-9]{32}\.jpg', name) or not (IMAGES / name).is_file():
+                    if not re.fullmatch(r'[a-f0-9]{32}\.jpg', name) or not STORAGE.image_path(name).is_file():
                         raise ValueError('A saved image is missing. Attach it again.')
                     image_count += 1
                     if image_count > 8:
                         raise ValueError('Up to eight images can be included in a conversation. Start a new chat.')
-                    encoded = base64.b64encode((IMAGES / name).read_bytes()).decode()
+                    encoded = base64.b64encode(STORAGE.image_path(name).read_bytes()).decode()
                     parts.append({'type': 'image_url', 'image_url': {'url': 'data:image/jpeg;base64,'+encoded}})
                 else:
                     raise ValueError('Unsupported content type.')
@@ -288,14 +359,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if not model.get('vision'):
                 raise ValueError('The loaded model is text-only. Load a vision model such as Qwen3.5 4B.')
         messages = normalized
-        if text_length > 24000:
+        context_limit = int(body.get('context_limit', 32768))
+        if not 1024 <= context_limit <= 65536:
+            raise ValueError('Context budget must be 1,024–65,536 tokens.')
+        if text_length > context_limit * 4:
             raise ValueError('This conversation is long. Compact context or start a new chat.')
         def number(key, default, low, high):
             value = float(body.get(key, default))
             if not math.isfinite(value) or not low <= value <= high:
                 raise ValueError(f'{key} must be between {low} and {high}.')
             return value
-        limit_value = number('max_tokens', 1024, 1, 32768)
+        limit_value = number('max_tokens', 1024, 1, 65536)
         if not limit_value.is_integer():
             raise ValueError('max_tokens must be a whole number.')
         limit = int(limit_value)
@@ -348,5 +422,27 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 atexit.register(unload)
+def watch_tabs(server):
+    while True:
+        time.sleep(2)
+        now = time.monotonic()
+        with TAB_LOCK:
+            for tab_id, seen in list(TABS.items()):
+                if now - seen > TAB_TIMEOUT:
+                    del TABS[tab_id]
+            should_stop = not TABS and now - LAST_TAB_ACTIVITY > (TAB_CLOSE_GRACE if SEEN_TAB else 120)
+        if should_stop:
+            STOPPING.set()
+            server.shutdown()
+            return
+
 if __name__ == '__main__':
-    http.server.ThreadingHTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
+    threading.Thread(target=watch_tabs, args=(server,), daemon=True).start()
+    try:
+        server.serve_forever()
+    finally:
+        STOPPING.set()
+        with LOCK:
+            unload()
+        server.server_close()

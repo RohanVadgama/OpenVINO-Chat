@@ -22,3 +22,16 @@ node_modules/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Optional backups, if a backup folder is placed inside the repository
+openvino-chat-backup*.json
+openvino-chat-images/
+openvino-chat-*.tmp
+
+
+# Generated Windows shortcuts contain absolute personal paths
+*.lnk
+# Datastore content, including when placed inside the source folder
+chats/
+chat-index.json
+*.tmp
