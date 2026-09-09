@@ -2,6 +2,7 @@
 import base64
 import re
 from storage import Storage
+from web_reader import read_link
 import atexit
 import hashlib
 import http.server
@@ -199,7 +200,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             process = PROCESS
             if process and process.poll() is not None and STATE['phase'] == 'ready':
                 STATE.update(phase='error', error='The model server stopped. Load the model again.')
-            return self.reply(dict(STATE, models=models(), token=TOKEN, purged=STORAGE.tombstones()))
+            return self.reply(dict(STATE, models=models(), token=TOKEN, capabilities=['read-link'], purged=STORAGE.tombstones()))
         if self.path.startswith('/images/'):
             name = self.path.removeprefix('/images/')
             if not re.fullmatch(r'[a-f0-9]{32}\.jpg', name) or not STORAGE.image_path(name).is_file():
@@ -252,6 +253,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     else:
                         TABS[tab_id] = LAST_TAB_ACTIVITY
                 return self.reply({'ok': True})
+            if self.path == '/api/read-link':
+                return self.reply(read_link(body.get('url', '')))
             if self.path == '/api/backup/config':
                 with BACKUP_LOCK:
                     config = STORAGE.configure(body)
@@ -436,8 +439,17 @@ def watch_tabs(server):
             server.shutdown()
             return
 
+class ChatServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def server_bind(self):
+        if hasattr(socket, 'SO_EXCLUSIVEADDRUSE'):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 if __name__ == '__main__':
-    server = http.server.ThreadingHTTPServer(('127.0.0.1', PORT), Handler)
+    server = ChatServer(('127.0.0.1', PORT), Handler)
     threading.Thread(target=watch_tabs, args=(server,), daemon=True).start()
     try:
         server.serve_forever()

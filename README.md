@@ -43,3 +43,6 @@ Closing the last chat tab now stops the chat server and its model process after 
 
 
 Generated .lnk shortcuts are ignored because they contain absolute paths. Run Create shortcuts.ps1 after cloning to create local shortcuts with the included icon. Keep all personal folder settings in ignored data/; never force-add datastore files.
+
+## Read a webpage
+Click Read link beside the composer, paste a public URL, and review the extracted text added to your draft before sending. This makes an external request only to the requested site and redirects; it sends no chat history or cookies. HTML and plain text are supported (2 MB download / 24,000-character excerpt limits). Login-only, JavaScript-only pages and PDFs are not supported. Page text counts toward context and is saved with the message. Local/private network URLs are blocked.
